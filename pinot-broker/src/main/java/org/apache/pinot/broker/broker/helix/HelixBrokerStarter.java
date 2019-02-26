@@ -21,12 +21,15 @@ package org.apache.pinot.broker.broker.helix;
 import com.google.common.collect.ImmutableList;
 import com.yammer.metrics.core.MetricsRegistry;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import org.apache.commons.configuration.Configuration;
 import org.apache.commons.configuration.PropertiesConfiguration;
 import org.apache.commons.lang.StringUtils;
 import org.apache.helix.HelixAdmin;
+import org.apache.helix.HelixConstants.ChangeType;
 import org.apache.helix.HelixManager;
 import org.apache.helix.HelixManagerFactory;
 import org.apache.helix.InstanceType;
@@ -68,7 +71,7 @@ public class HelixBrokerStarter {
   private final HelixExternalViewBasedRouting _helixExternalViewBasedRouting;
   private final BrokerServerBuilder _brokerServerBuilder;
   private final ZkHelixPropertyStore<ZNRecord> _propertyStore;
-  private final LiveInstancesChangeListenerImpl _liveInstancesListener;
+  private final LiveInstanceChangeHandler _liveInstanceChangeHandler;
   private final MetricsRegistry _metricsRegistry;
   private final TableQueryQuotaManager _tableQueryQuotaManager;
   private final TimeboundaryRefreshMessageHandlerFactory _tbiMessageHandler;
@@ -89,8 +92,6 @@ public class HelixBrokerStarter {
       Configuration pinotHelixProperties)
       throws Exception {
     LOGGER.info("Starting Pinot broker");
-
-    _liveInstancesListener = new LiveInstancesChangeListenerImpl(helixClusterName);
 
     _pinotHelixProperties = DefaultHelixBrokerConfig.getDefaultBrokerConf(pinotHelixProperties);
 
@@ -118,14 +119,20 @@ public class HelixBrokerStarter {
     _helixExternalViewBasedRouting = new HelixExternalViewBasedRouting(_propertyStore, _spectatorHelixManager,
         pinotHelixProperties.subset(ROUTING_TABLE_PARAMS_SUBSET_KEY));
     _tableQueryQuotaManager = new TableQueryQuotaManager(_spectatorHelixManager);
+    _liveInstanceChangeHandler = new LiveInstanceChangeHandler(_spectatorHelixManager);
+    Map<ChangeType, ClusterChangeHandler> clusterChangeHandlerMap = new HashMap<>();
+    clusterChangeHandlerMap.put(ChangeType.EXTERNAL_VIEW,
+        new ExternalViewChangeHandler(_helixExternalViewBasedRouting, _tableQueryQuotaManager));
+    clusterChangeHandlerMap
+        .put(ChangeType.INSTANCE_CONFIG, new InstanceConfigChangeHandler(_helixExternalViewBasedRouting));
+    clusterChangeHandlerMap.put(ChangeType.LIVE_INSTANCE, _liveInstanceChangeHandler);
     _brokerServerBuilder = startBroker(_pinotHelixProperties);
     _metricsRegistry = _brokerServerBuilder.getMetricsRegistry();
     ClusterChangeMediator clusterChangeMediator =
-        new ClusterChangeMediator(_helixExternalViewBasedRouting, _tableQueryQuotaManager,
-            _brokerServerBuilder.getBrokerMetrics());
+        new ClusterChangeMediator(clusterChangeHandlerMap, _brokerServerBuilder.getBrokerMetrics());
     _spectatorHelixManager.addExternalViewChangeListener(clusterChangeMediator);
     _spectatorHelixManager.addInstanceConfigChangeListener(clusterChangeMediator);
-    _spectatorHelixManager.addLiveInstanceChangeListener(_liveInstancesListener);
+    _spectatorHelixManager.addLiveInstanceChangeListener(clusterChangeMediator);
 
     // Connect participant Helix manager.
     _helixManager =
@@ -193,7 +200,7 @@ public class HelixBrokerStarter {
       config = DefaultHelixBrokerConfig.getDefaultBrokerConf();
     }
     BrokerServerBuilder brokerServerBuilder = new BrokerServerBuilder(config, _helixExternalViewBasedRouting,
-        _helixExternalViewBasedRouting.getTimeBoundaryService(), _liveInstancesListener, _tableQueryQuotaManager);
+        _helixExternalViewBasedRouting.getTimeBoundaryService(), _liveInstanceChangeHandler, _tableQueryQuotaManager);
     _accessControlFactory = brokerServerBuilder.getAccessControlFactory();
     _helixExternalViewBasedRouting.setBrokerMetrics(brokerServerBuilder.getBrokerMetrics());
     _tableQueryQuotaManager.setBrokerMetrics(brokerServerBuilder.getBrokerMetrics());
